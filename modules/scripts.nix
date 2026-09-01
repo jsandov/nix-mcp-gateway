@@ -126,7 +126,7 @@ in
     # Keycloak realm and MongoDB data — and requires mcpgw-bootstrap again.
     if ! colima status >/dev/null 2>&1; then
       echo "==> Starting Colima (${toString vmCpus} CPU / ${toString vmMemoryGiB}GB RAM / ${toString vmDiskGiB}GB disk)"
-      colima start --cpus ${toString vmCpus} --memory ${toString vmMemoryGiB} --disk ${toString vmDiskGiB}
+      colima start --cpu ${toString vmCpus} --memory ${toString vmMemoryGiB} --disk ${toString vmDiskGiB}
     fi
 
     # Upstream's prepare-log-dirs.sh sudo-chowns /var/log/containers on the
@@ -143,8 +143,60 @@ in
     # (chown fails), so make sure they exist host-side first.
     mkdir -p keycloak/themes keycloak/providers
 
+    # Same problem, other tree: build_and_run.sh pre-creates most
+    # $HOME/mcp-gateway/* mount sources but misses logs/ (the "legacy
+    # path" audit-log mount), and the VM daemon can't chown-create it
+    # through the home-dir mount either.
+    mkdir -p "$HOME/mcp-gateway/logs"
+
     colima ssh -- sudo sh -c \
       'mkdir -p /var/log/containers/ai-registry && chown -R 1000:1000 /var/log/containers/ai-registry && chmod 750 /var/log/containers/ai-registry'
+
+    # Apple M4/M5 hosts: the vz (Virtualization.framework) guest advertises
+    # SVE vector extensions that the hypervisor then traps, so native
+    # runtime CPU-feature probes crash on first use — the Keycloak JVM
+    # SIGILLs at startup, and pyca/cryptography's bundled OpenSSL kills
+    # registry/auth-server on `import pymongo`. When the guest shows SVE,
+    # pin the probes off via a compose override (docker compose auto-loads
+    # docker-compose.override.yml). The k6 companion flake manages the same
+    # file cooperatively — it keys on the "mcpgw-sve" marker and preserves
+    # these vars when it layers in its Prometheus tweak.
+    if colima ssh -- grep -q sve /proc/cpuinfo 2>/dev/null; then
+      if [ ! -f docker-compose.override.yml ]; then
+        echo "==> SVE-trapping guest detected — pinning CPU-feature probes off (compose override)"
+        cat > docker-compose.override.yml <<'SVE_EOF'
+# mcpgw-sve: local compose override, installed by mcpgw-up.
+# This guest advertises SVE that the macOS hypervisor traps (Apple M4/M5);
+# disable runtime CPU-feature probing in the affected native stacks:
+#   JVM (Keycloak)              -XX:UseSVE=0
+#   OpenSSL (pyca/cryptography) OPENSSL_armcap=0
+services:
+  keycloak:
+    environment:
+      - JAVA_OPTS_APPEND=-XX:UseSVE=0
+  registry:
+    environment:
+      - OPENSSL_armcap=0
+  auth-server:
+    environment:
+      - OPENSSL_armcap=0
+  mcpgw-server:
+    environment:
+      - OPENSSL_armcap=0
+SVE_EOF
+      elif ! grep -q 'mcpgw-sve' docker-compose.override.yml; then
+        if grep -q 'mcpgw' docker-compose.override.yml; then
+          # Older mcpgw-k6 override without the SVE vars: replace; the next
+          # k6 run detects the lost remote-write flag and re-layers it.
+          echo "==> Refreshing stale mcpgw compose override with SVE mitigation"
+          rm docker-compose.override.yml
+          exec "$0" "$@"
+        fi
+        echo "A docker-compose.override.yml exists that mcpgw didn't create." >&2
+        echo "Merge the SVE env vars into it (see nix-mcp-gateway README), then re-run." >&2
+        exit 1
+      fi
+    fi
 
     # Upstream's blessed entry point; --prebuilt pulls multi-arch images
     # from public.ecr.aws instead of building. It ends with an interactive
